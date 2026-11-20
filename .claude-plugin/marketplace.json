@@ -6,7 +6,7 @@
     {
       "name": "shipwright",
       "source": "./plugins/shipwright",
-      "description": "Orchestrate implementer and reviewer sub-agents in waves to ship a multi-issue goal as one PR, verified end to end, with tracker updates and a final report.",
+      "description": "Orchestrate implementer and reviewer sub-agents in waves to ship a multi-issue goal as one PR, with contract tests, re-checked claims, tracker updates and a final report.",
       "category": "productivity",
       "tags": ["orchestration", "subagents", "worktrees", "pull-requests", "linear"]
     }

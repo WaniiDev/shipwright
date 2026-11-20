@@ -12,7 +12,7 @@ const BAND = {
   plugin: 'shipwright',
   component: 'AbovePrompt',
   requestId: 'band',
-  props: { hasSurvey: false, isWorking: true, maxRows: 6, bodyColumns: 80, scroll: { offset: 0, bodyRows: 6 }, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: true, maxRows: 6, bodyColumns: 80, scroll: { offset: 0, bodyRows: 6 }, view: {} },
 } as const
 const CONDITION = 'shipwright run for WAN-1. Met when the latest reply ends with a line starting "GOAL: DONE", "GOAL: PARTIAL" or "GOAL: BLOCKED".'
 
@@ -289,6 +289,115 @@ describe('shipwright goal mode', () => {
     expect((await ended.find({ type: 'Text', text: /^Shipped$/ }))?.props.color).toBe('success')
     expect(String((await ended.find({ type: 'Svg' }))?.props.source)).toContain('M5.5 9.2')
     await ended.unmount()
+  })
+})
+
+const LANES = 'mcp__shipwright__lane_update'
+const lanes = ($: Engine, ...rows: Record<string, unknown>[]) => $.tool.call({ tool: LANES, lanes: rows } as never)
+const agentReports = ($: Engine) =>
+  $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'a1', reason: 'answer', agentId: 'lane-a' } as never)
+
+describe('shipwright guards and stalls', () => {
+  test("a force push is refused behind git's own options too", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    await begin($)
+    expect((await bash($, 'git -C /repo push --force origin feat/x')).deny).toMatch(/force push/)
+    expect((await bash($, 'git -C "/my repo" -c push.default=current push -f')).deny).toMatch(/force push/)
+    expect((await bash($, 'git --git-dir=/repo/.git push origin +feat/x')).deny).toMatch(/force push/)
+    expect((await bash($, 'git -C /repo push origin feat/x')).deny).toBeUndefined()
+    expect((await bash($, 'git -C /repo commit -m "push -f later"')).deny).toBeUndefined()
+  })
+
+  test('agent reports count as progress only so many times with no new commit', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    await begin($, { max_idle_calls: 3 })
+    for (let i = 0; i < 12; i++) {
+      await bash($, 'ls')
+      expect((await bash($, 'ls')).context).toBeUndefined()
+      await agentReports($)
+    }
+    await bash($, 'ls')
+    await bash($, 'ls')
+    await agentReports($)
+    expect((await bash($, 'ls')).context?.join(' ')).toMatch(/3 tool calls with no new commit/)
+  })
+
+  test('a new commit lets agent reports count again', async ($, on) => {
+    mock.clock(on)
+    const w = world(on)
+    await begin($, { max_idle_calls: 3 })
+    for (let i = 0; i < 13; i++) await agentReports($)
+    w.heads[0] = 'bbb'
+    await bash($, 'git merge --no-ff lane-1')
+    await bash($, 'ls')
+    await bash($, 'ls')
+    await agentReports($)
+    expect((await bash($, 'ls')).context).toBeUndefined()
+  })
+})
+
+describe('shipwright lane ledger', () => {
+  test('it keeps the lanes, returns the table and shows the count in the band', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    expect((await lanes($, { id: 'api', status: 'planned' })).deny).toMatch(/call run_start first/)
+    await begin($)
+    await lanes($, { id: 'api', wave: 1, issues: 'WAN-1', status: 'planned' }, { id: 'ui', wave: 2, issues: 'WAN-2', status: 'planned' })
+    const merged = await lanes($, { id: 'api', status: 'merged', note: 'abc123' })
+    expect(String(merged.result)).toBe('id | wave | issues | status | note\napi | 1 | WAN-1 | merged | abc123\nui | 2 | WAN-2 | planned | ')
+    expect(String((await lanes($)).result)).toContain('ui | 2 | WAN-2 | planned')
+
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect((await band.find({ type: 'Text', text: /▦/ }))?.text).toBe('Shipping feat/x   ◷ 0m/8h  ↻ 0/60  ▦ 1/2')
+    await band.unmount()
+  })
+
+  test('a third retry is refused, and a merged or dropped lane is final', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    await begin($)
+    await lanes($, { id: 'api', status: 'building' })
+    await lanes($, { id: 'api', status: 'retry' })
+    expect(String((await lanes($, { id: 'api', status: 'retry' })).result)).toContain('retry 2')
+    expect((await lanes($, { id: 'api', status: 'retry' })).deny).toMatch(/used its 2 retries/)
+    expect((await lanes($, { id: 'ui', status: 'planned' }, { id: 'api', status: 'retry' })).deny).toMatch(/used its 2 retries/)
+    expect(String((await lanes($)).result)).not.toContain('ui')
+
+    await lanes($, { id: 'api', status: 'dropped', note: 'typecheck still fails' })
+    expect((await lanes($, { id: 'api', status: 'building' })).deny).toMatch(/dropped, which is final/)
+    expect((await lanes($, { id: 'api', status: 'later' })).deny).toMatch(/needs id and status/)
+  })
+
+  test('run_finish refuses DONE while a planned lane is not merged', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    await begin($)
+    await lanes($, { id: 'api', status: 'merged' }, { id: 'ui', status: 'dropped', note: 'needs a secret' }, { id: 'w1-fix1', fix: true, status: 'dropped' })
+    const done = await $.tool.call({ tool: FINISH, outcome: 'DONE', summary: 'PR #1 open' } as never)
+    expect(done.deny).toMatch(/Not merged: ui \(dropped\)\. .*finish as PARTIAL/)
+    expect((await bash($, 'ls')).deny).toBeUndefined()
+    const partial = await $.tool.call({ tool: FINISH, outcome: 'PARTIAL', summary: 'api shipped; ui dropped' } as never)
+    expect(String(partial.result)).toContain('GOAL: PARTIAL')
+  })
+
+  test("a compaction keeps the lanes in the main conversation's summary", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const told: (string | undefined)[] = []
+    on('session.compact', ($, e) => {
+      told.push(e.instructions)
+      return { messages: e.messages }
+    })
+    await begin($)
+    await $.session.compact({ trigger: 'auto', messages: TRANSCRIPT })
+    await lanes($, { id: 'api', wave: 1, issues: 'WAN-1', status: 'building' })
+    await $.session.compact({ trigger: 'auto', messages: TRANSCRIPT })
+    await $.session.compact({ trigger: 'auto', agentId: 'lane-a', messages: TRANSCRIPT })
+    expect(told[0]).toBeUndefined()
+    expect(told[1]).toContain('api | 1 | WAN-1 | building')
+    expect(told[2]).toBeUndefined()
   })
 })
 

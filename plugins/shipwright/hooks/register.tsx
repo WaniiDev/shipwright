@@ -1,11 +1,12 @@
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { ActiveGoal, ActivePlan, Limits, Outcome, Run } from '../types'
+import type { ActiveGoal, ActivePlan, Lane, LaneStatus, Limits, Outcome, Run } from '../types'
 
 // Goal mode and exit paths for a shipwright run, enforced in code
 // instead of prose: start_goal (queues /goal and keeps its finish line in the
 // system prompt), run_start / run_finish tools, a progress and budget
-// watchdog, a quiet-run wake-up, /shipwright-stop, a /goal clear on every
+// watchdog, a quiet-run wake-up, the lane ledger (lane_update: the retry cap
+// and what DONE may claim), /shipwright-stop, a /goal clear on every
 // terminal state, and command guards while a run is active. Before a run,
 // plan_step chains /shipwright:plan's commands: wayfinder, to-spec, to-tickets,
 // then a compaction and /shipwright:run.
@@ -19,6 +20,8 @@ const FINISH = 'mcp__shipwright__run_finish'
 const START_GOAL = 'mcp__shipwright__start_goal'
 const PLAN = { plugin: 'shipwright', key: 'plan' } as const
 const PLAN_STEP = 'mcp__shipwright__plan_step'
+const LANES = 'mcp__shipwright__lane_update'
+const STATUSES: readonly LaneStatus[] = ['planned', 'contract', 'building', 'retry', 'waiting', 'merged', 'dropped']
 // The command each plan stage runs, by its name without a plugin prefix.
 const STEPS = { wayfinder: 'wayfinder', spec: 'to-spec', tickets: 'to-tickets' } as const
 const NEXT = ['wayfinder', 'spec', 'tickets', 'ship', 'stop'] as const
@@ -41,13 +44,16 @@ export const DEFAULTS: Limits = {
   maxSameFailure: 3,
   graceCalls: 15,
   maxQuietMinutes: 45,
+  maxReports: 12,
+  maxRetries: 2,
 }
 
 // Commands no agent may run while a run is active.
 export const GUARDS: readonly (readonly [RegExp, string])[] = [
   [/(^|[\s;&|(])(pkill|killall)\s/, 'never kill by pattern; kill only PIDs you started'],
   [/\bkill\b[^;&|]*\$\(\s*pgrep/, 'never kill by pattern; kill only PIDs you started'],
-  [/\bgit\s+push\b[^;&|]*\s(--force(?![\w-])|-f\b|\+\S)/, 'no force push (use --force-with-lease on your own lane branch if you must)'],
+  // git's own options (-C <dir>, -c <key=value>, --git-dir=…) may sit between `git` and `push`.
+  [/\bgit(?:\s+(?:-[cC]\s+(?:"[^"]*"|'[^']*'|\S+)|--[\w-]+(?:=\S+)?))*\s+push\b[^;&|]*\s(--force(?![\w-])|-f\b|\+\S)/, 'no force push (use --force-with-lease on your own lane branch if you must)'],
   [/\bgit\b[^;&|]*\s--no-verify\b/, 'never skip git hooks'],
 ]
 
@@ -65,6 +71,28 @@ export function finalLine(outcome: Outcome, summary: string, userAction?: string
 }
 
 let run: Run | null = null
+
+// A run saved by an earlier version has no ledger and no newer limits.
+function restore(stored: Run | null | undefined): Run | null {
+  if (!stored) return null
+  return { ...stored, reports: stored.reports ?? 0, lanes: stored.lanes ?? {}, limits: { ...DEFAULTS, ...stored.limits } }
+}
+
+function laneStatus(lane: Lane): string {
+  return lane.status === 'retry' ? `retry ${lane.retries}` : lane.status
+}
+
+// The ledger as the orchestrator reads it back: after every lane_update and in a compaction's summary.
+export function lanesTable(current: Run): string {
+  const rows = Object.values(current.lanes)
+  if (rows.length === 0) return 'No lanes recorded yet.'
+  return ['id | wave | issues | status | note', ...rows.map(lane => `${lane.id} | ${lane.wave} | ${lane.issues} | ${laneStatus(lane)} | ${lane.note}`)].join('\n')
+}
+
+// What keeps a run from being DONE: a planned lane that isn't merged, or a fix lane still open.
+function unshipped(current: Run): Lane[] {
+  return Object.values(current.lanes).filter(lane => lane.status !== 'merged' && !(lane.fix && lane.status === 'dropped'))
+}
 let ticker: Timer | null = null
 
 async function save($: $): Promise<void> {
@@ -102,7 +130,8 @@ function duration(ms: number): string {
   return minutes % 60 === 0 ? `${minutes / 60}h` : `${Math.floor(minutes / 60)}h${minutes % 60}m`
 }
 
-// Numbers, not sentences: ◷ time used of the budget, ↻ calls since the last commit of the limit. The reasons
+// Numbers, not sentences: ◷ time used of the budget, ↻ calls since the last commit of the limit, ▦ lanes merged
+// of those recorded. The reasons
 // and the summary are in the transcript already.
 export function runView(current: Run, now: number): RunView {
   const { limits, branch } = current
@@ -110,7 +139,9 @@ export function runView(current: Run, now: number): RunView {
   const budget = limits.maxHours * 3_600_000
   const time = Math.min(1, Math.max(0, elapsed / budget))
   const clock = `◷ ${duration(elapsed)}/${duration(budget)}`
-  const calls = `↻ ${current.idleCalls}/${limits.maxIdleCalls}`
+  const all = Object.values(current.lanes)
+  const lanes = all.length === 0 ? '' : `  ▦ ${all.filter(lane => lane.status === 'merged').length}/${all.length}`
+  const calls = `↻ ${current.idleCalls}/${limits.maxIdleCalls}${lanes}`
   if (current.phase === 'active') {
     const stalling = current.idleCalls / limits.maxIdleCalls >= STALLING
     return { tone: stalling ? 'stalling' : 'active', label: 'Shipping', branch, detail: `${clock}  ${calls}`, time }
@@ -156,6 +187,7 @@ async function headOf($: $, current: Run): Promise<string> {
 
 function progress(current: Run, now: number): void {
   current.idleCalls = 0
+  current.reports = 0
   current.failures = {}
   current.quietWakes = 0
   current.lastActivityAt = now
@@ -320,6 +352,33 @@ async function commandNamed($: $, name: string): Promise<string | undefined> {
   return names.find(one => one === name) ?? names.find(one => one.endsWith(`:${name}`))
 }
 
+const laneSpec = {
+  name: 'lane_update',
+  description:
+    "The shipwright run's lane ledger: record every lane when the plan is written and every status change after. It returns the whole table; with no lanes it only reads it. It refuses a retry past the limit (drop the lane instead) and any change to a merged or dropped lane, and run_finish refuses DONE while a planned lane isn't merged.",
+  isDeferred: true,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      lanes: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            status: { type: 'string', enum: STATUSES, description: 'retry: one more gap list sent back to the same implementer.' },
+            wave: { type: 'number' },
+            issues: { type: 'string', description: 'The issue keys the lane covers.' },
+            fix: { type: 'boolean', description: 'A fix lane (review or gate findings), not a planned one.' },
+            note: { type: 'string', description: 'The merged sha, the lane it waits for, or why it was dropped.' },
+          },
+          required: ['id', 'status'],
+        },
+      },
+    },
+  },
+}
+
 function finishLine(goal: ActiveGoal): string {
   return [
     'A shipwright run is active in this session, in goal mode.',
@@ -331,8 +390,9 @@ function finishLine(goal: ActiveGoal): string {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    run = (await $.state.get(RUN)).value ?? null
+    run = restore((await $.state.get(RUN)).value)
     await $.tool.register(startGoalSpec)
+    await $.tool.register(laneSpec)
     await $.tool.register(startSpec)
     await $.tool.register(finishSpec)
     await $.tool.register(planStepSpec)
@@ -464,8 +524,12 @@ export const register: Register = on => {
   on('session.compact', async ($, e, next) => {
     const goal = e.agentId === undefined ? ((await $.state.get(GOAL)).value ?? null) : null
     const plan = e.agentId === undefined ? ((await $.state.get(PLAN)).value ?? null) : null
-    if (goal === null && plan === null) return next(e)
-    const lines = [goal && finishLine(goal), plan && planLine(plan)].filter(Boolean).join('\n\n')
+    const ledger =
+      e.agentId === undefined && run !== null && Object.keys(run.lanes).length > 0
+        ? `The run's lanes (lane_update with no lanes reads them again):\n${lanesTable(run)}`
+        : null
+    if (goal === null && plan === null && ledger === null) return next(e)
+    const lines = [goal && finishLine(goal), plan && planLine(plan), ledger].filter(Boolean).join('\n\n')
     const keep = `Keep this in the summary, word for word:\n${lines}`
     return next({ ...e, instructions: e.instructions ? `${e.instructions}\n\n${keep}` : keep })
   }).catch(($, e, next) => next(e))
@@ -490,6 +554,8 @@ export const register: Register = on => {
       checkedAt: now,
       head: '',
       idleCalls: 0,
+      reports: 0,
+      lanes: {},
       failures: {},
       quietWakes: 0,
       graceLeft: limits.graceCalls,
@@ -515,6 +581,12 @@ export const register: Register = on => {
     if (outcome === undefined || summary === '') return { deny: 'run_finish needs outcome (DONE, PARTIAL or BLOCKED) and a summary.' }
     const userAction = typeof input.user_action === 'string' && input.user_action.trim() !== '' ? input.user_action.trim() : undefined
     const line = finalLine(outcome, summary, userAction)
+    const open = run !== null && outcome === 'DONE' ? unshipped(run) : []
+    if (open.length > 0) {
+      return {
+        deny: `DONE needs every planned lane merged. Not merged: ${open.map(lane => `${lane.id} (${laneStatus(lane)})`).join(', ')}. Record what is true with lane_update, or finish as PARTIAL.`,
+      }
+    }
     if (run !== null) {
       end($, run, 'ended', outcome, userAction ? `${summary}; you must: ${userAction}` : summary)
       await save($)
@@ -524,9 +596,46 @@ export const register: Register = on => {
     }
   }).catch(() => ({ deny: 'run_finish failed inside the shipwright mod; end your reply with the GOAL line yourself.' }))
 
+  on('tool.call', { tool: LANES }, async ($, e) => {
+    if (run === null || run.phase === 'ended' || run.phase === 'stopped') return { deny: 'lane_update needs an active run: call run_start first.' }
+    const current = run
+    const rows = (e as unknown as { lanes?: unknown }).lanes
+    // Every row is checked before any is kept, so a refused call changes nothing.
+    const lanes = { ...current.lanes }
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const one = (row ?? {}) as Record<string, unknown>
+      const text = (key: string) => (typeof one[key] === 'string' ? (one[key] as string).trim() : '')
+      const id = text('id')
+      const status = STATUSES.find(each => each === one.status)
+      if (id === '' || status === undefined) return { deny: `Each lane needs id and status: one of ${STATUSES.join(', ')}.` }
+      const before = lanes[id]
+      if (before !== undefined && before.status !== status && (before.status === 'merged' || before.status === 'dropped')) {
+        return { deny: `Lane ${id} is ${before.status}, which is final. New work on its files is a fix lane with its own id.` }
+      }
+      const retries = (before?.retries ?? 0) + (status === 'retry' ? 1 : 0)
+      if (retries > current.limits.maxRetries) {
+        return {
+          deny: `Lane ${id} has used its ${current.limits.maxRetries} retries. Drop it (status dropped, note: its first gap), or merge it if its only gaps are its pre-merge review's findings.`,
+        }
+      }
+      lanes[id] = {
+        id,
+        wave: num(one.wave, before?.wave ?? 1),
+        issues: text('issues') || (before?.issues ?? ''),
+        fix: typeof one.fix === 'boolean' ? one.fix : (before?.fix ?? false),
+        status,
+        retries,
+        note: text('note') || (before?.status === status ? before.note : ''),
+      }
+    }
+    current.lanes = lanes
+    await save($)
+    return { result: lanesTable(current) }
+  }).catch(() => ({ deny: 'lane_update failed inside the shipwright mod; keep the lanes table in RUN.md instead.' }))
+
   // Every other tool call: the guards, the terminal lock, and the watchdog.
   on('tool.call', async ($, e, next) => {
-    if (e.tool === START || e.tool === FINISH || e.tool === START_GOAL || e.tool === PLAN_STEP || String(e.tool).startsWith(TURN_TOOLS) || run === null) {
+    if (e.tool === START || e.tool === FINISH || e.tool === START_GOAL || e.tool === PLAN_STEP || e.tool === LANES || String(e.tool).startsWith(TURN_TOOLS) || run === null) {
       return next(e)
     }
     const current = run
@@ -598,7 +707,7 @@ export const register: Register = on => {
 
   // The band: a ring on desktop, Claude's ✻ in the terminal, one line each. It yields to a survey and leaves with the run.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const current = (await $.state.get(RUN)).value ?? null
+    const current = restore((await $.state.get(RUN)).value)
     if (current === null || e.props.hasSurvey) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
     const view = runView(current, await $.clock.now())
@@ -631,9 +740,14 @@ export const register: Register = on => {
     const done = await next(e)
     if (run === null) return done
     if (e.agentId !== undefined) {
-      // A sub-agent reported back: activity, and progress for the stall count.
+      // A sub-agent reported back: activity, and progress for the stall count, but only so many reports in a
+      // row with no new commit. Past that, agents that keep failing no longer hold the watchdog off.
       if (run.phase === 'active') {
-        progress(run, await $.clock.now())
+        const reports = run.reports + 1
+        const now = await $.clock.now()
+        if (reports <= run.limits.maxReports) progress(run, now)
+        run.reports = reports
+        run.lastActivityAt = now
         await save($)
       }
       return done

@@ -4,7 +4,7 @@ You drive the build: sub-agents build and review, and you check, merge and decid
 
 Every agent runs in the background (its definition says so), with `model` and `effort` from the plan (a lane's own override `models.implementer`). While agents run, end your turn with the line `Waiting for the lanes.`; each result arrives as a notification. A goal check-in or the watchdog's quiet-run notice before then gets the same line and no tool calls. Never poll, and never do an agent's work yourself.
 
-**Lanes table.** Keep one row per lane in `RUN.md`, fix lanes included, and update it on every change: `id | wave | agent name | status (contract, building, retry <n>, waiting <id>, merged <sha>, dropped) | why`. Save each agent's report to `reports/<agent name>.md` and keep one verdict line in context.
+**Lanes table.** The mod holds it. Call `lane_update` on every change, fix lanes included (`fix: true`), several lanes in one call when they change together: `id`, `status` (`contract`, `building`, `retry`, `waiting`, `merged`, `dropped`) and a `note` (the merged sha, the lane it waits for, why it was dropped). Each call returns the whole table, a call with no lanes only reads it, and a compaction keeps it. Record `retry` before you send a lane its gaps: a refused one means the lane is out of retries. Without `lane_update` (mods off), keep the same rows in `RUN.md`. Save each agent's report to `reports/<agent name>.md` and keep one verdict line in context.
 
 ## A wave
 
@@ -114,6 +114,6 @@ Write `reports/ship.json` (the report skill and delivery read it):
 
 ## Resume and stop
 
-- After a compaction, the lanes table says where each lane is; finish the step it records.
+- After a compaction, the lanes table (`lane_update` with no lanes) says where each lane is; finish the step it records.
 - After the session restarted (its agents are gone; a lane's last report never came): for each lane still `building` or `retry`, launch a new implementer with the same name and prompt, plus "Your worktree has your earlier commits: continue from them." Relaunch a lost review or contract the same way.
 - The watchdog's wrap-up notice: `TaskStop` each running agent, then go to delivery with what merged, as `PARTIAL`.

@@ -13,7 +13,7 @@ Goal: $ARGUMENTS
 
 Read each reference only at its step: [intake](references/intake.md) (0), [brief template](references/brief-template.md) (2), [ship](references/ship.md) (3), [delivery](references/delivery.md) (4). Progress format: [status](../status/SKILL.md). Final results: [report](../report/SKILL.md).
 
-**State** lives in the scratchpad (else `.shipwright/` in the session temp dir): `RUN.md` (choices, plan, the lanes table, gate results), `DECISIONS.md` (one line per decision: what, why, which source), `BRIEF.md`, `reports/`. After a compaction, re-read `RUN.md` first. After a container restart, restart services (for example the DB).
+**State** lives in the scratchpad (else `.shipwright/` in the session temp dir): `RUN.md` (choices, plan, gate results), `DECISIONS.md` (one line per decision: what, why, which source), `BRIEF.md`, `reports/`. After a compaction, re-read `RUN.md` first. After a container restart, restart services (for example the DB).
 
 ## Every run
 
@@ -39,7 +39,7 @@ Load `mcp__ccd_session_mgmt__get_usage` with `ToolSearch` (`select:mcp__ccd_sess
 Right after the intake (`--auto` included), before recon, so the run can't lose its finish line. Goal mode re-checks the condition after every turn, waits while the agents run, and the mod clears it when the run ends.
 1. Write the condition into `RUN.md`, at most 4,000 characters, judged from the conversation alone: "shipwright run for <goal>, state in <RUN.md path>. Met when the orchestrator's latest reply ends with a line starting `GOAL: DONE`, `GOAL: PARTIAL` or `GOAL: BLOCKED`. Until then the run works toward: every issue's Done-when met, the final gate green, and <branch pushed | PR open with CI green | PR merged into <base> with CI green>. Also met after 80 turns."
 2. Already inside a `/goal` that names this plugin: it is set. Record it in `RUN.md` and go on.
-3. Otherwise, load the run tools with one `ToolSearch` (`select:mcp__shipwright__start_goal,mcp__shipwright__run_start,mcp__shipwright__run_finish`). Then, first match wins:
+3. Otherwise, load the run tools with one `ToolSearch` (`select:mcp__shipwright__start_goal,mcp__shipwright__run_start,mcp__shipwright__lane_update,mcp__shipwright__run_finish`). Then, first match wins:
    - `start_goal` with `condition` and `run_file` (the absolute `RUN.md` path): say in one line that goal mode is armed and end your turn. `/goal` starts when the turn ends and brings you back (Step 0c).
    - `ProposeGoal`, if the session offers it: the condition cut to 500 characters (the full one stays in `RUN.md`); `ask_user: false` only when the user picked the finish line. End your turn.
    - Neither: around, give the user `/goal <condition>` to paste and wait; away, say so in one line and carry on.
@@ -81,6 +81,7 @@ On every turn of a run (after `/goal` starts one, a compaction, a resume or an a
   }
   ```
   `models` holds the intake's choices; a lane's own `model` and `effort` (the `--auto` picks above) override `models.implementer` for that lane. `kind` defaults to `code`; `risk: "high"` (auth, money, data loss, migrations) adds a review before that lane merges when other lanes build alongside it. Give every goal with screens a `ui`, even with no design reference: leave `reference` out and the auditors check the screen's Done-when items at each size (`sizes` defaults to desktop 1280×720 and phone 390×844). The screens are audited once, at the final gate. `areas` splits that audit, one auditor per area with its own DB and port; with none, one auditor covers every screen. Leave `ui` out for goals without screens, or when `RUN.md` says `ui: skip`; `ui: desktop` sets `sizes` to desktop 1280×720 only. Set `"push": false` when the repo has no remote. Set `"contract": false` when `defaults:` drops contract.
+- Record every lane with one `lane_update` call (`id`, `wave`, `issues`, status `planned`). From here on the mod holds the lanes table: [ship](references/ship.md) says when to update it.
 - In the session's task list: one item per wave, then "Final gate" and "Deliver".
 - Unless `RUN.md` turns tracker updates off: move each issue to In Progress and post a checkpoint naming its lane and wave. Read [delivery](references/delivery.md)'s Tracker section for the format.
 
@@ -112,7 +113,7 @@ Start from `reports/ship.json`'s `outcome`; delivery can lower it, never raise i
 
 Before `run_finish`, in order: push (when there is a remote), update `RUN.md`, `DECISIONS.md` and the PR or draft PR, remove the worktrees. After `run_finish`, make no more tool calls (the app's own end-of-turn wrap-up excepted), and end the reply with the `GOAL: …` line it returns. In away mode a block is not a question: finish, and the user reads the line when they're back.
 
-The plugin's mod enforces this with a watchdog and says what to do when one of its limits trips; follow its notices. Without `run_start` (Claude Code before v2.1.287, or mods off), wrap up yourself after 60 tool calls with no new commit, the same command failing 3 times, or the time budget, and end with `GOAL: DONE|PARTIAL|BLOCKED — <summary>`.
+The plugin's mod enforces this with a watchdog and says what to do when one of its limits trips; follow its notices. It also holds the lanes: `lane_update` refuses a third retry of a lane, and `run_finish` refuses `DONE` while a planned lane isn't merged, so record what is true and finish as `PARTIAL`. Without `run_start` (Claude Code before v2.1.287, or mods off), wrap up yourself after 60 tool calls with no new commit, the same command failing 3 times, or the time budget, and end with `GOAL: DONE|PARTIAL|BLOCKED — <summary>`.
 
 ## Progress
 

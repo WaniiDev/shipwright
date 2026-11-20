@@ -1,6 +1,30 @@
 # shipwright
 
-A Claude Code plugin that ships a goal (an issue and its sub-issues, a plan doc, or a written goal) as **one PR on one branch** with a team of sub-agents, verified end to end.
+A Claude Code plugin that ships a goal (an issue and its sub-issues, a plan doc, or a written goal) as **one PR on one branch** with a team of sub-agents. The orchestrator works as the project manager: it plans the lanes, re-checks what each agent claims, and may only call the run done when the mod's own lane ledger agrees.
+
+What sets it apart from asking one session to do the goal:
+- **Acceptance tests come first, from a different agent.** The implementer has to pass them and may not edit them, and the orchestrator checks both.
+- **Claims are re-run, not trusted.** A lane's checks are run again and the counts compared before it merges.
+- **The run's end is enforced in code.** A watchdog and a lane ledger in the mod stop loops, cap retries, and refuse `DONE` while a planned lane isn't merged.
+
+**Status.** The mod has tests and CI. Whether a whole run beats one plain session on quality and cost is not measured yet: [evals](evals/README.md) holds a fixture goal and a runner for that, with no runs recorded so far.
+
+## What you get
+
+A branch or PR with one merge commit per lane, a PR body listing the issues shipped, the decisions made without you, the final gate's commands and counts, and every finding still open. The reply ends with one line:
+
+```
+GOAL: DONE — PR #42 open, CI green; WAN-346 and its 4 sub-issues shipped
+GOAL: PARTIAL — PR #42 (draft); 3 of 5 shipped; you must: add STRIPE_KEY for WAN-349
+GOAL: BLOCKED — nothing merged; you must: sign in to the tracker
+```
+
+## Needs
+
+- Claude Code v2.1.287 or newer for the mod (the watchdog, the ledger, the band). Without it the skills still run and follow the same rules from their own text.
+- `git` with worktrees, and for a PR, `gh` or the session's own PR tools.
+- For `/shipwright:plan` only: the mattpocock-skills plugin.
+- The usage numbers in the final results need the desktop app.
 
 ## What it does
 
@@ -68,7 +92,7 @@ Or ask in plain words ("ship WAN-346 and its sub-issues as one PR while I sleep"
 
 It needs the mattpocock-skills plugin and `/setup-matt-pocock-skills` run once in the repo. If wayfinder charts a map with open decisions, the plan stops there: work the map with `/wayfinder <map>`, then run `/shipwright:plan <map>`. `/shipwright-stop` ends a plan.
 
-After the intake, the run arms `/goal` itself (`start_goal`), so it keeps going until a terminal state and never past one: goal mode waits while the agents run, and every terminal state clears it. The lanes table in `RUN.md` shows where each lane is. `/shipwright-stop` ends a run by hand (as `BLOCKED`) and clears `/goal`.
+After the intake, the run arms `/goal` itself (`start_goal`), so it keeps going until a terminal state and never past one: goal mode waits while the agents run, and every terminal state clears it. The mod's lane ledger shows where each lane is, and the band counts the lanes merged. `/shipwright-stop` ends a run by hand (as `BLOCKED`) and clears `/goal`.
 
 Headless (`claude -p`): set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`. Otherwise print mode stops background work 10 minutes after the last turn, which cuts the lanes off mid-run.
 
@@ -81,9 +105,9 @@ Every run, without being told, goes in one go (no "shall I continue?", no waitin
 - `skills/run/`: the method (`SKILL.md`) and its references, each read only at its step: intake, the brief template, the ship phase (waves, checks, merges, fix lanes, the final gate) with its review prompts, and delivery.
 - `skills/plan/`: idea to tickets to `/shipwright:run`, through the mod's `plan_step`.
 - `skills/status/`, `skills/report/`: the progress and final-results formats. Only you invoke them, so they add nothing to a session's context until used.
-- `hooks/register.tsx` (a Claude Code mod, v2.1.287+): a band above the prompt while a run is active (one line: a thin ring for the time budget in the desktop app, Claude's ✻ in the terminal; amber when the run stalls, a mark when it ends), `start_goal` (arms `/goal` after the intake and keeps the finish line in the system prompt and in what a compaction keeps), `run_start` / `run_finish` tools, a progress and budget watchdog (no new commit, repeated failures, time, quiet runs), `plan_step` (types the next command of a `/shipwright:plan` and keeps its stage in the system prompt), `/shipwright-stop`, `/goal clear` on every terminal state, and guards against `pkill`/`killall`, force push and `--no-verify` while a run is active.
+- `hooks/register.tsx` (a Claude Code mod, v2.1.287+): a band above the prompt while a run is active (one line: a thin ring for the time budget in the desktop app, Claude's ✻ in the terminal; amber when the run stalls, a mark when it ends), `start_goal` (arms `/goal` after the intake and keeps the finish line in the system prompt and in what a compaction keeps), `run_start` / `run_finish` tools, a progress and budget watchdog (no new commit, repeated failures, time, quiet runs, agent reports that stop counting as progress after 12 in a row with no commit), the lane ledger (`lane_update`: every lane's status, at most 2 retries a lane, merged and dropped are final, kept through a compaction, and `run_finish` refuses `DONE` while a planned lane isn't merged), `plan_step` (types the next command of a `/shipwright:plan` and keeps its stage in the system prompt), `/shipwright-stop`, `/goal clear` on every terminal state, and guards against `pkill`/`killall`, force push and `--no-verify` while a run is active.
 - `agents/implementer.md` (default Sonnet · medium), `agents/reviewer.md` and `agents/ui-auditor.md` (default Opus · xhigh). Each carries its own rules, so prompts carry only the lane's facts. The intake's choices override the models per run.
-- Tests: `claude plugin test plugins/shipwright` (the mod).
+- Tests: `claude plugin test plugins/shipwright` (the mod; CI runs it on every push and PR). The skills' text has no unit tests: [evals](evals/README.md) runs a fixture goal with shipwright and with one plain session and scores both against hidden acceptance tests.
 
 ## Token use
 
@@ -96,3 +120,7 @@ Every run, without being told, goes in one go (no "shall I continue?", no waitin
 - Docs-only and test-only lanes skip contract tests and review. A blocked lane stops at once instead of retrying.
 - The watchdog stops loops before they burn tokens.
 - Measured: the final results show the tokens the ship phase's agents spent, and, in the desktop app, your plan's 5-hour and weekly usage before and after the run and the orchestrator's context size (read with the app's `get_usage` tool; the CLI and cloud sessions don't have it).
+
+## License
+
+[MIT](LICENSE)
